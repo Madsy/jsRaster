@@ -1,8 +1,4 @@
-var vertexShader = function(attribute, uniforms){
-	//Write the output position
-	//In a more elaborate example, it should be something like:
-	//attribute["jsRasterPosition"] = vec4.transformMat3(attribute["vertex"], attribute["vertex"], uniforms.modelviewProjectionMatrix);
-	
+var vertexShader = function(attribute, uniforms){	
 	var v = vec4.fromValues(
 		attribute.vertex[0],
 		attribute.vertex[1],
@@ -11,22 +7,21 @@ var vertexShader = function(attribute, uniforms){
 	);
 
 	vec4.transformMat4(v, v, uniforms.modelviewMatrix);
-	v[2] -= 6.0;
+	v[2] -= 4.0;
 	vec4.transformMat4(v, v, uniforms.projectionMatrix);
-	//attribute["jsRasterPosition"] = v;
 
 	/* Important! Make a deep copy which the rasterizer can modify without touching the reference mesh data! */
 	var retAttr = {
 		vertex: new Float32Array(attribute.vertex),
 		color: new Float32Array(attribute.color),
-		jsRasterPosition: new Float32Array(v)
+		jsRasterPosition: new Float32Array(v) //Must write this special property which represents the vertex positions!
 	};
 	
 	return retAttr;
 };
 
-var fragmentShader = function(){
-	var color = vec4.fromValues(0.0, 0.0, 1.0, 1.0);
+var fragmentShader = function(varyings, uniforms){
+	var color = vec4.fromValues(varyings["color"][2], varyings["color"][2], varyings["color"][2], 1.0);
 	return color;
 };
 
@@ -57,8 +52,7 @@ window.onload = function(){
 
 	var persp = mat4.create();
 	var model = mat4.create();
-	mat4.perspective(90.0, 4/3, 1, 100, persp );
-	//mat4.rotate(model, model, Math.PI/4, [0, 1, 0]);
+	mat4.perspective(persp, 90.0, 4/3, 1, 100);
 
 	uniforms = {
 		projectionMatrix: persp,
@@ -66,12 +60,12 @@ window.onload = function(){
 	};
 
 	var redraw = function(){
-		rot += 1.0/60.0;
+		rot += 1.0/240.0;
 		while(rot >= 1.0){
 			rot -= 1.0;
 		}
 		mat4.identity(uniforms.modelviewMatrix);
-		mat4.rotate(uniforms.modelviewMatrix, uniforms.modelviewMatrix, Math.PI*2.0*rot, [0, 1, 0]);
+		mat4.rotate(uniforms.modelviewMatrix, uniforms.modelviewMatrix, Math.PI*2.0*rot, [0, 1.0, 0]);
 		r.clear();
 		r.render(data, ["vertex", "color"], uniforms, ["projectionMatrix", "modelviewMatrix"], vertexShader, fragmentShader);
 		r.flip();

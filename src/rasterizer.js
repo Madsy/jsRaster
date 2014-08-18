@@ -12,7 +12,7 @@ jsRaster.Rasterizer = function(canvas, enableExceptions){
 	this.depthbuffer = new Float32Array(this.width * this.height);
 	this.exceptionsEnabled = enableExceptions;
 	this.attributes = null;
-	//Tile size base. Must be POT. TODO: Makes this configureable?
+	//Tile size base. Tile size must be POT. TODO: Makes this configureable?
 	this.Q = 3;
 	//Actual Tile size
 	this.q = (1<<this.Q);
@@ -28,28 +28,77 @@ jsRaster.Rasterizer.prototype.clipping = function(){
 	
 };
 
+var once = true;
+
 jsRaster.Rasterizer.prototype.project = function(v){
 	var proj,
 	centerX = this.width*0.5,
 	centerY = this.height*0.5,
 	wInv = 1.0 / v[3];
 
+	if(once === true){
+		console.log("x y z w: " + v[0] + " " + v[1] + " " + + v[2] + " " + v[3]);
+		console.log("wInv: " + wInv);
+		console.log("centerX, centerY: " + centerX + " " + centerY);
+	}
 	/* perspective divide */
 	proj = vec4.fromValues(v[0] * wInv, v[1] * wInv, v[2] * wInv, wInv);
 	proj[0] = proj[0]*centerX + centerX;
 	proj[1] = proj[1]*centerY + centerY;
 	proj[2] = proj[2]*0.5 + 0.5;
-	proj[3] = v[3]; //wInv;
+	//proj[3] = v[3]; //wInv;
+
+	if(once === true){
+		console.log("screenspace x y z w: " + proj[0] + " " + proj[1] + " " + + proj[2] + " " + proj[3]);
+		once = false;
+	}
+
 	return proj;
 };
 
 jsRaster.Rasterizer.prototype.rasterize = function(pixelCallback){
 	var v1,v2,v3;
-	var attribs = {};
-	var i,x,y;
+	var i,k,x,y;
 	var col;
 	var ix, iy;
 	var pixel;
+	var that = this;
+	var interpInfo = {};
+	var varyings = {};
+	var pixelDst;
+	/*
+	  dYdS: [0.343, 0.344], //slopes for two Y edges
+	  dXdS: 0.343, //slope for final interpolated X value
+	  dYdSAccum: [0.343, 0.344], //accum for two Y edges, interpolated across Y
+	  dXdSAccum: 0.134 //accum for X, interpolated across X
+	 */
+	/* Assume all vertices have attribute vectors of equal length!
+	 I.e if that.attributes[0]["vertex"] is a Float32Array of length 3, then so are all the other vertices. */
+	this.attributeNames.forEach(function(name){
+		/* Initialize per-varying data need to interpolate the values */
+		var attrLen = that.attributes[0][name].length;
+		var i;
+		if(name == "jsRasterPosition"){
+			return;
+		}
+		interpInfo[name] = new Array(attrLen);
+		for(i = 0; i < attrLen; i++){
+			interpInfo[name][i] = {
+				samples: [0.0, 0.0, 0.0, 0.0], //'s' samples at corners points for tile
+				dYdS: [0.0, 0.0], //Y-slope for 's' values at left and right y-edge
+				dXdS: 0.0, //X-slope for 's' values at left and right side of scanline
+				dYdSAccum: [0.0, 0.0], //accumulators for interpolation along y-edges
+				value: 0.0 //The value, but still divided by w
+			};
+		}
+
+		/* varyings[name][i] represents the final interpolated varying based on the 3 vertex attributes in a triangle.
+		   varyings[name] is the vector/array while varyings[name][i] is the specific scalar component */
+		varyings[name] = new Float32Array(attrLen);
+		for(i = 0; i < attrLen; i++){
+			varyings[name][i] = 0.0;
+		}
+	});
 
 	for(i = 0; i < this.attributes.length; i+=3){
 		v1 = this.attributes[i + 0]["jsRasterPosition"];
@@ -159,17 +208,127 @@ jsRaster.Rasterizer.prototype.rasterize = function(pixelCallback){
 				// Skip block when outside an edge
 				if(a == 0x0 || b == 0x0 || c == 0x0) continue;
 
+				/* Compute interpolants for tile */
+				var NDC_x_step = 2.0 / this.width;
+				var NDC_y_step = 2.0 / this.height;
+
+				/* min/max bounds of tile in NDC space */
+				var NDC_x0 = (x * NDC_x_step) - 1.0;  //min x
+				var NDC_y0 = (y * NDC_y_step) - 1.0;  //min y
+				var NDC_x1 = ((x + this.q - 1) * NDC_x_step) - 1.0; //max x
+				var NDC_y1 = ((y + this.q - 1) * NDC_y_step) - 1.0; //max y
+
+				/* Setup 1/w and z/w for interpolation. These are special cases. The general attrib/varying case is further below */
+				var Az = v1[2];
+				var Bz = v2[2];
+				var Cz = v3[2];
+
+				var Aw = v1[3];
+				var Bw = v2[3];
+				var Cw = v3[3];
+
+				var samplesZ = new Array(4);
+				var samplesW = new Array(4);
+
+				var dYdSz = new Array(2);
+				var dYdSw = new Array(2);
+
+				var dYdSAccumZ = new Array(2);
+				var dYdSAccumW = new Array(2);
+
+				samplesZ[0] = NDC_x0*Az + NDC_y0*Bz + Cz;
+				samplesZ[1] = NDC_x0*Az + NDC_y1*Bz + Cz;
+				samplesZ[2] = NDC_x1*Az + NDC_y0*Bz + Cz;
+				samplesZ[3] = NDC_x1*Az + NDC_y1*Bz + Cz;				
+				samplesW[0] = NDC_x0*Aw + NDC_y0*Bw + Cw;
+				samplesW[1] = NDC_x0*Aw + NDC_y1*Bw + Cw;
+				samplesW[2] = NDC_x1*Aw + NDC_y0*Bw + Cw;
+				samplesW[3] = NDC_x1*Aw + NDC_y1*Bw + Cw;
+
+				dYdSz[0] = (samplesZ[1] - samplesZ[0]) / that.q; //left Y edge
+				dYdSz[1] = (samplesZ[3] - samplesZ[2]) / that.q; //right Y edge
+				dYdSw[0] = (samplesW[1] - samplesW[0]) / that.q; //left Y edge
+				dYdSw[1] = (samplesW[3] - samplesW[2]) / that.q; //right Y edge
+
+				dYdSAccumZ[0] = samplesZ[0]; //start value for left accumulator
+				dYdSAccumZ[1] = samplesZ[2]; //start value for right accumulator
+				dYdSAccumW[0] = samplesW[0]; //start value for left accumulator
+				dYdSAccumW[1] = samplesW[2]; //start value for right accumulator
+
+				/* Setup of accumulators, deltas and derivatives for each attribute/varying scalar component */
+				this.attributeNames.forEach(function(name){
+					interpInfo[name].forEach(function(elem, idx, arr){
+						var A = that.attributes[i+0][name][idx];
+						var B = that.attributes[i+1][name][idx];
+						var C = that.attributes[i+2][name][idx];
+						elem.samples[0] = NDC_x0*A + NDC_y0*B + C;
+						elem.samples[1] = NDC_x0*A + NDC_y1*B + C;
+						elem.samples[2] = NDC_x1*A + NDC_y0*B + C;
+						elem.samples[3] = NDC_x1*A + NDC_y1*B + C;
+						elem.dYdS[0] = (elem.samples[1] - elem.samples[0]) / that.q; //left Y edge
+						elem.dYdS[1] = (elem.samples[3] - elem.samples[2]) / that.q; //right Y edge
+						elem.dYdSAccum[0] = elem.samples[0]; //start value for left accumulator
+						elem.dYdSAccum[1] = elem.samples[2]; //start value for right accumulator
+					});
+				});
+
 				//full cover
 				if(a == 0xF && b == 0xF && c == 0xF){
 					col  = y*this.width;					
-					for(iy = y; iy < y + this.q; iy++){						
+					for(iy = y; iy < y + this.q; iy++){
+
+						var zOverW = dYdSAccumZ[0];
+						var oneOverW = dYdSAccumW[0];
+						var dXdSZ = (dYdSAccumZ[1] - dYdSAccumZ[0]) / that.q;
+						var dXdSW = (dYdSAccumW[1] - dYdSAccumW[0]) / that.q;
+
+						/* Set start value for X-accumulator (the varying) and compute the derivative */
+						this.attributeNames.forEach(function(name){
+							interpInfo[name].forEach(function(elem, idx, arr){
+								elem.value = elem.dYdSAccum[0]; //start value
+								elem.dXdS = (elem.dYdSAccum[1] - elem.dYdSAccum[0]) / that.q;
+							});
+						});
+
 						for(ix = x; ix < x + this.q; ix++){
-							pixel = pixelCallback();
-							this.framebuffer.data[(col + ix)*4 + 0] = (pixel[0] << 8) - (pixel[0] << 0);
-							this.framebuffer.data[(col + ix)*4 + 1] = (pixel[1] << 8) - (pixel[1] << 0);
-							this.framebuffer.data[(col + ix)*4 + 2] = (pixel[2] << 8) - (pixel[2] << 0);
-							this.framebuffer.data[(col + ix)*4 + 3] = (pixel[3] << 8) - (pixel[3] << 0);
+
+							/* finally set each varying to its proper value which is (s/w) / (1/w) */
+							this.attributeNames.forEach(function(name){
+								for(k = 0; k < varyings[name].length; k++){
+									varyings[name][k] = interpInfo[name][k].value / oneOverW;
+								}
+							});
+							pixel = pixelCallback(varyings, this.uniforms);
+							pixelDst = (col + ix)*4;
+							this.framebuffer.data[pixelDst + 0] = (pixel[0] * 255) << 0;
+							this.framebuffer.data[pixelDst + 1] = (pixel[1] * 255) << 0;
+							this.framebuffer.data[pixelDst + 2] = (pixel[2] * 255) << 0;
+							this.framebuffer.data[pixelDst + 3] = (pixel[3] * 255) << 0;
+
+							//Step W and Z one pixel forward with their derivatives
+							zOverW += dXdSZ;
+							oneOverW += dXdSW;
+ 
+							//Step the varyings one pixel forward with their derivatives
+							this.attributeNames.forEach(function(name){
+								for(k = 0; k < varyings[name].length; k++){
+									interpInfo[name][k].value += interpInfo[name][k].dXdS;
+								}
+							});
 						}
+						/* Update Y-edge accumulators for Z and W with their derivatives */
+						dYdSAccumZ[0] += dYdSz[0];
+						dYdSAccumZ[1] += dYdSz[1];
+						dYdSAccumW[0] += dYdSw[0];
+						dYdSAccumW[1] += dYdSw[1];
+
+						/* Update Y-edge accumulators with their derivatives */
+						this.attributeNames.forEach(function(name){
+							interpInfo[name].forEach(function(elem, idx, arr){
+								elem.dYdSAccum[0] += elem.dYdS[0];
+								elem.dYdSAccum[1] += elem.dYdS[1];
+							});
+						});
 						col += this.width;
 					}
 				} else { //partial cover
@@ -181,18 +340,60 @@ jsRaster.Rasterizer.prototype.rasterize = function(pixelCallback){
 						var CX1 = CY1;
 						var CX2 = CY2;
 						var CX3 = CY3;
+						var zOverW = dYdSAccumZ[0];
+						var oneOverW = dYdSAccumW[0];
+						var dXdSZ = (dYdSAccumZ[1] - dYdSAccumZ[0]) / that.q;
+						var dXdSW = (dYdSAccumW[1] - dYdSAccumW[0]) / that.q;
+
+						/* Set start value for X-accumulator (the varying) and compute the derivative */
+						this.attributeNames.forEach(function(name){
+							interpInfo[name].forEach(function(elem, idx, arr){
+								elem.value = elem.dYdSAccum[0]; //start value
+								elem.dXdS = (elem.dYdSAccum[1] - elem.dYdSAccum[0]) / that.q;
+							});
+						});
+
 						for(ix = x; ix < x + this.q; ix++){
 							if(CX1 > 0 && CX2 > 0 && CX3 > 0) {
-								pixel = pixelCallback();
-								this.framebuffer.data[(col + ix)*4 + 0] = (pixel[0] << 8) - (pixel[0] << 0);
-								this.framebuffer.data[(col + ix)*4 + 1] = (pixel[1] << 8) - (pixel[1] << 1);
-								this.framebuffer.data[(col + ix)*4 + 2] = (pixel[2] << 8) - (pixel[2] << 2);
-								this.framebuffer.data[(col + ix)*4 + 3] = (pixel[3] << 8) - (pixel[3] << 3);
+								/* finally set each varying to its proper value which is (s/w) / (1/w) */
+								this.attributeNames.forEach(function(name){
+									for(k = 0; k < varyings[name].length; k++){
+										varyings[name][k] = interpInfo[name][k].value / oneOverW;
+									}
+								});
+								pixel = pixelCallback(varyings, this.uniforms);
+								pixelDst = (col + ix)*4;
+								this.framebuffer.data[pixelDst + 0] = (pixel[0] * 255) << 0;
+								this.framebuffer.data[pixelDst + 1] = (pixel[1] * 255) << 0;
+								this.framebuffer.data[pixelDst + 2] = (pixel[2] * 255) << 0;
+								this.framebuffer.data[pixelDst + 3] = (pixel[3] * 255) << 0;
 							}
+							//Step W and Z one pixel forward with their derivatives
+							zOverW += dXdSZ;
+							oneOverW += dXdSW;
+							//Step the varyings one pixel forward with their derivatives
+							this.attributeNames.forEach(function(name){
+								for(k = 0; k < varyings[name].length; k++){
+									interpInfo[name][k].value += interpInfo[name][k].dXdS;
+								}
+							});
 							CX1 -= FDY12;
 							CX2 -= FDY23;
 							CX3 -= FDY31;
 						}
+						/* Update Y-edge accumulators for Z and W with their derivatives */
+						dYdSAccumZ[0] += dYdSz[0];
+						dYdSAccumZ[1] += dYdSz[1];
+						dYdSAccumW[0] += dYdSw[0];
+						dYdSAccumW[1] += dYdSw[1];
+
+						/* Update Y-edge accumulators with their derivatives */
+						this.attributeNames.forEach(function(name){
+							interpInfo[name].forEach(function(elem, idx, arr){
+								elem.dYdSAccum[0] += elem.dYdS[0];
+								elem.dYdSAccum[1] += elem.dYdS[1];
+							});
+						});
 						col += this.width;
 						CY1 += FDX12;
 						CY2 += FDX23;
@@ -303,7 +504,7 @@ jsRaster.Rasterizer.prototype.computecoeffs = function(){
 			if((s1 instanceof Float32Array) || (s1 instanceof Array)){			
 				/* We assume all three vectors/arrays are of equal length */
 				len = s1.length;
-				ABC = vec3.create();
+				ABC = new Float32Array(len);
 				for(j = 0; j < len; j++){
 					ABC[0] = s1[j];
 					ABC[1] = s2[j];
